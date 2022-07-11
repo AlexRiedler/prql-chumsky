@@ -71,12 +71,14 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     let fstrings = just('f').ignore_then(string_expr.clone()).collect::<String>().map(Token::FStr);
 
     let date = just('@')
-        .ignore_then(text::int(10).repeated().exactly(4).collect::<String>())
-        .then_ignore(just("-"))
-        .then(text::int(10).repeated().exactly(2).collect::<String>())
-        .then_ignore(just("-"))
-        .then(text::int(10).repeated().exactly(2).collect::<String>())
-        .map( |((year, month), day)| Token::Date(year, month, day)); // TODO: fix
+        .ignore_then(
+            filter(|c: &char| c.is_digit(10)).repeated().exactly(4).collect()
+            .then_ignore(just("-"))
+            .then(filter(|c: &char| c.is_digit(10)).repeated().exactly(2).collect())
+            .then_ignore(just("-"))
+            .then(filter(|c: &char| c.is_digit(10)).repeated().exactly(2).collect())
+        )
+        .map( |((year, month), day)| Token::Date(year, month, day));
 
     let op = one_of("+-*/!=><?.")
         .repeated()
@@ -96,11 +98,13 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         "group" => Token::Group,
         "aggregate" => Token::Aggregate,
         "sort" => Token::Sort,
+        "true" => Token::Bool(true),
+        "false" => Token::Bool(false),
         _ => Token::Ident(ident),
     });
 
-    let token = num
-        .or(date)
+    let token = date
+        .or(num)
         .or(fstrings)
         .or(strings)
         .or(op)
@@ -130,7 +134,7 @@ enum Value {
     Range(f64, f64), // TODO: leave as string?
     Str(String),
     FStr(String),
-    // TODO: DATE
+    Date(String, String, String),
     List(Vec<Value>),
 }
 
@@ -144,19 +148,6 @@ struct Error {
     msg: String,
 }
 
-impl Value {
-    fn num(self, span: Span) -> Result<f64, Error> {
-        if let Value::Num(x) = self {
-            Ok(x)
-        } else {
-            Err(Error {
-                span,
-                msg: format!("'{}' is not a number", self),
-            })
-        }
-    }
-}
-
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -166,6 +157,7 @@ impl std::fmt::Display for Value {
             Self::Range(x, y) => write!(f, "{}..{}", x, y),
             Self::Str(x) => write!(f, "{}", x),
             Self::FStr(x) => write!(f, "{}", x),
+            Self::Date(y, m, d) => write!(f, "{}-{}-{}", y, m, d),
             Self::List(xs) => write!(
                 f,
                 "[{}]",
@@ -211,9 +203,7 @@ enum Expr {
     Local(String),
     List(Vec<Spanned<Self>>),
     Bool(Box<Spanned<Self>>, Spanned<Operator>, Box<Spanned<Self>>),
-    Then(Box<Spanned<Self>>, Box<Spanned<Self>>),
     Assignment(String, Box<Spanned<Self>>),
-    Math(Box<Spanned<Self>>, String, Box<Spanned<Self>>),
     Binary(Box<Spanned<Self>>, BinaryOp, Box<Spanned<Self>>),
     Average(Box<Spanned<Self>>),
     Sum(Box<Spanned<Self>>),
@@ -221,7 +211,6 @@ enum Expr {
 
 #[derive(Debug)]
 enum Transform {
-    FromTable(String, Vec<Spanned<Self>>),
     Filter(Box<Spanned<Expr>>),
     Group(Vec<Spanned<String>>, Vec<Spanned<Self>>),
     Aggregate(Vec<Spanned<Expr>>),
@@ -241,42 +230,44 @@ struct Query {
     tables: Vec<Spanned<Table>>,
 }
 
+
+fn bool_expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + Clone {
+    let value_expr = value_expr_parser();
+    let operator = select! { Token::Op(op) => op.clone() }.labelled("operator");
+    recursive(|raw_bool_expr| {
+        value_expr.clone()
+            .map_with_span(|expr, span: Span| (expr, span))
+            .then(operator)
+            .then(value_expr.clone().map_with_span(|expr, span: Span| (expr, span)))
+            .map(|(((expr_a, span_a), op), (expr_b, span_b))| {
+                let span = span_a.start..span_b.end;
+                (
+                    Expr::Bool(
+                        Box::new(expr_a),
+                        (Operator::Unknown(op), 0..0), // TODO:
+                        Box::new(expr_b),
+                    ),
+                    span
+                )
+            })
+
+    })
+}
+
 fn table_parser() -> impl Parser<Token, Spanned<Table>, Error = Simple<Token>> + Clone {
     let ident = select! { Token::Ident(ident) => ident.clone() }.labelled("identifier");
-    let raw_expr = raw_expr_parser();
+    let ident_list =
+        ident
+        .clone()
+        .map_with_span(|ident, span| (ident, span))
+        .separated_by(just(Token::Ctrl(',')))
+        .allow_trailing()
+        .delimited_by(just(Token::Ctrl('[')).or_not(), just(Token::Ctrl(']')).or_not());
+
+    let value_expr = value_expr_parser();
+    let bool_expr = bool_expr_parser();
 
     let pipeline = recursive(|pipeline_expr: Recursive<Token, Spanned<Transform>, _>| {
-        let operator = select! { Token::Op(op) => op.clone() }.labelled("operator");
-
-        // TODO: can do better then this
-        let bool_expr = recursive(|raw_bool_expr| {
-            raw_expr.clone()
-                .map_with_span(|expr, span: Span| (expr, span))
-                .then(operator)
-                .then(raw_expr.clone().map_with_span(|expr, span: Span| (expr, span)))
-                .map(|(((expr_a, span_a), op), (expr_b, span_b))| {
-                    let span = span_a.start..span_b.end;
-                    (
-                        Expr::Bool(
-                            Box::new(expr_a),
-                            (Operator::Unknown(op), 0..0),
-                            Box::new(expr_b),
-                        ),
-                        span
-                    )
-                })
-
-        });
-
-
-        let ident_list =
-            ident
-            .clone()
-            .map_with_span(|ident, span| (ident, span))
-            .separated_by(just(Token::Ctrl(',')))
-            .allow_trailing()
-            .delimited_by(just(Token::Ctrl('[')).or_not(), just(Token::Ctrl(']')).or_not());
-
         let filter_transform =
             just(Token::Filter)
             .ignore_then(bool_expr)
@@ -285,13 +276,13 @@ fn table_parser() -> impl Parser<Token, Spanned<Table>, Error = Simple<Token>> +
         let assignment =
             ident
             .then_ignore(just(Token::Op("=".to_string())))
-            .then(raw_expr.clone())
+            .then(value_expr.clone())
             .map_with_span(|(ident, expr), span| (Expr::Assignment(ident, Box::new(expr)), span));
 
         let aggregate_transform =
             just(Token::Aggregate)
             .ignore_then(
-                assignment.clone().or(raw_expr.clone())
+                assignment.clone().or(value_expr.clone())
                     .separated_by(just(Token::Ctrl(','))).allow_trailing()
                     .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')))
             )
@@ -371,33 +362,33 @@ fn table_parser() -> impl Parser<Token, Spanned<Table>, Error = Simple<Token>> +
         })
 }
 
-fn raw_expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + Clone {
-    recursive(|raw_expr| {
+fn value_expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + Clone {
+    recursive(|value_expr| {
         let val = select! {
             Token::Null => Expr::Value(Value::Null),
             Token::Bool(x) => Expr::Value(Value::Bool(x)),
             Token::Num(n) => Expr::Value(Value::Num(n.parse().unwrap())),
             Token::Str(s) => Expr::Value(Value::Str(s)),
             Token::FStr(s) => Expr::Value(Value::FStr(s)),
-            // TODO: DATE
+            Token::Date(y, m, d) => Expr::Value(Value::Date(y, m, d)),
         }
         .labelled("value");
 
         let ident = select! { Token::Ident(ident) => ident.clone() }.labelled("identifier");
 
-        let items = raw_expr
+        let items = value_expr
             .clone()
             .separated_by(just(Token::Ctrl(',')))
             .allow_trailing();
 
         let average =
             just(Token::Ident("average".to_string()))
-            .ignore_then(raw_expr.clone())
+            .ignore_then(value_expr.clone())
             .map(|expr| Expr::Average(Box::new(expr)));
 
         let sum =
             just(Token::Ident("sum".to_string()))
-            .ignore_then(raw_expr.clone())
+            .ignore_then(value_expr.clone())
             .map(|expr| Expr::Sum(Box::new(expr)));
 
         let list = items
@@ -412,9 +403,7 @@ fn raw_expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>>
             .or(ident.map(Expr::Local))
             .or(list)
             .map_with_span(|expr, span| (expr, span))
-            .or(raw_expr
-                .clone()
-                .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')'))))
+            .or(value_expr.clone().delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')'))))
             .recover_with(nested_delimiters(
                 Token::Ctrl('('),
                 Token::Ctrl(')'),
