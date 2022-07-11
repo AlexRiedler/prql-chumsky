@@ -127,6 +127,7 @@ enum Value {
     Null,
     Bool(bool),
     Num(f64), // TODO: leave as string?
+    Range(f64, f64), // TODO: leave as string?
     Str(String),
     FStr(String),
     // TODO: DATE
@@ -162,6 +163,7 @@ impl std::fmt::Display for Value {
             Self::Null => write!(f, "null"),
             Self::Bool(x) => write!(f, "{}", x),
             Self::Num(x) => write!(f, "{}", x),
+            Self::Range(x, y) => write!(f, "{}..{}", x, y),
             Self::Str(x) => write!(f, "{}", x),
             Self::FStr(x) => write!(f, "{}", x),
             Self::List(xs) => write!(
@@ -216,6 +218,7 @@ enum Expr {
     Aggregate(Vec<Spanned<Self>>),
     Derive(Vec<Spanned<Self>>), // TODO: these are all assignments
     Sort(Vec<Spanned<SortColumn>>),
+    Take(Value),
     Assignment(String, Box<Spanned<Self>>),
     Math(Box<Spanned<Self>>, String, Box<Spanned<Self>>),
     Binary(Box<Spanned<Self>>, BinaryOp, Box<Spanned<Self>>),
@@ -422,6 +425,20 @@ fn expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + C
 
             let sort_transform = just(Token::Sort).ignore_then(sort_columns);
 
+            let number = select! { Token::Num(n) => n.parse().unwrap() }.labelled("number");
+            let number_expr = number.map(|n| Value::Num(n));
+
+            let number_range =
+                number
+                .then_ignore(just(Token::Op("..".to_string())))
+                .then(number)
+                .map(|(a, b)| Value::Range(a, b));
+
+            let take_transform =
+                just(Token::Ident("take".to_string()))
+                .ignore_then(number_range.or(number_expr))
+                .map(|num_or_range| Expr::Take(num_or_range));
+
             let from_transform =
                 just(Token::From)
                 .ignore_then(ident)
@@ -434,6 +451,7 @@ fn expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + C
                 .or(derive_transform.clone())
                 .or(aggregate_transform.clone())
                 .or(sort_transform.clone())
+                .or(take_transform.clone())
                 .then_ignore(just(Token::Ctrl('|')).or_not())
                 .map_with_span(|expr, span: Span| (expr, span))
         });
