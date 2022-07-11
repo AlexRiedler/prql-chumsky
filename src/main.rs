@@ -14,6 +14,7 @@ enum Token {
     Bool(bool),
     Num(String),
     Str(String),
+    FStr(String),
     Date(String, String, String),
     Op(String),
     Ident(String),
@@ -23,7 +24,8 @@ enum Token {
     Filter,
     Select,
     Group,
-
+    Aggregate,
+    Sort,
 }
 
 impl fmt::Display for Token {
@@ -32,7 +34,8 @@ impl fmt::Display for Token {
             Token::Null => write!(f, "null"),
             Token::Bool(x) => write!(f, "{}", x),
             Token::Num(n) => write!(f, "{}", n),
-            Token::Str(s) => write!(f, "{}", s),
+            Token::Str(s) => write!(f, "\"{}\"", s),
+            Token::FStr(s) => write!(f, "f\"{}\"", s),
             Token::Date(y, m, d) => write!(f, "{}-{}-{}", y, m, d),
             Token::Op(s) => write!(f, "{}", s),
             Token::Ctrl(c) => write!(f, "{}", c),
@@ -42,7 +45,8 @@ impl fmt::Display for Token {
             Token::Filter => write!(f, "filter"),
             Token::Select => write!(f, "select"),
             Token::Group => write!(f, "group"),
-
+            Token::Aggregate => write!(f, "aggregate"),
+            Token::Sort => write!(f, "sort"),
         }
     }
 }
@@ -54,11 +58,17 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         .collect::<String>()
         .map(Token::Num);
 
-    let strings = just('"')
+    let string_expr =
+        just('"')
         .ignore_then(filter(|c| *c != '"').repeated())
-        .then_ignore(just('"'))
+        .then_ignore(just('"'));
+
+    let strings =
+        string_expr.clone()
         .collect::<String>()
         .map(Token::Str);
+
+    let fstrings = just('f').ignore_then(string_expr.clone()).collect::<String>().map(Token::FStr);
 
     let date = just('@')
         .ignore_then(text::int(10).repeated().exactly(4).collect::<String>())
@@ -84,11 +94,14 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         "filter" => Token::Filter,
         "select" => Token::Select,
         "group" => Token::Group,
+        "aggregate" => Token::Aggregate,
+        "sort" => Token::Sort,
         _ => Token::Ident(ident),
     });
 
     let token = num
         .or(date)
+        .or(fstrings)
         .or(strings)
         .or(op)
         .or(ctrl)
@@ -115,6 +128,7 @@ enum Value {
     Bool(bool),
     Num(f64), // TODO: leave as string?
     Str(String),
+    FStr(String),
     // TODO: DATE
     List(Vec<Value>),
 }
@@ -149,6 +163,7 @@ impl std::fmt::Display for Value {
             Self::Bool(x) => write!(f, "{}", x),
             Self::Num(x) => write!(f, "{}", x),
             Self::Str(x) => write!(f, "{}", x),
+            Self::FStr(x) => write!(f, "{}", x),
             Self::List(xs) => write!(
                 f,
                 "[{}]",
@@ -174,6 +189,19 @@ enum BinaryOp {
     Nullify,
 }
 
+#[derive(Clone, Debug)]
+enum SortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug)]
+struct SortColumn {
+    direction: SortDirection,
+    column: String,
+}
+
+
 #[derive(Debug)]
 enum Expr {
     Error,
@@ -184,11 +212,15 @@ enum Expr {
     Then(Box<Spanned<Self>>, Box<Spanned<Self>>),
     FromTable(String, Vec<Spanned<Self>>),
     Filter(Box<Spanned<Self>>),
-    Group(Vec<Spanned<String>>, Box<Spanned<Self>>),
+    Group(Vec<Spanned<String>>, Vec<Spanned<Self>>),
+    Aggregate(Vec<Spanned<Self>>),
     Derive(Vec<Spanned<Self>>), // TODO: these are all assignments
+    Sort(Vec<Spanned<SortColumn>>),
     Assignment(String, Box<Spanned<Self>>),
     Math(Box<Spanned<Self>>, String, Box<Spanned<Self>>),
     Binary(Box<Spanned<Self>>, BinaryOp, Box<Spanned<Self>>),
+    Average(Box<Spanned<Self>>),
+    Sum(Box<Spanned<Self>>),
 }
 
 fn expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + Clone {
@@ -199,6 +231,7 @@ fn expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + C
                 Token::Bool(x) => Expr::Value(Value::Bool(x)),
                 Token::Num(n) => Expr::Value(Value::Num(n.parse().unwrap())),
                 Token::Str(s) => Expr::Value(Value::Str(s)),
+                Token::FStr(s) => Expr::Value(Value::FStr(s)),
                 // TODO: DATE
             }
             .labelled("value");
@@ -210,13 +243,25 @@ fn expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + C
                 .separated_by(just(Token::Ctrl(',')))
                 .allow_trailing();
 
+            let average =
+                just(Token::Ident("average".to_string()))
+                .ignore_then(raw_expr.clone())
+                .map(|expr| Expr::Average(Box::new(expr)));
+
+            let sum =
+                just(Token::Ident("sum".to_string()))
+                .ignore_then(raw_expr.clone())
+                .map(|expr| Expr::Sum(Box::new(expr)));
+
             let list = items
                 .clone()
                 .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')))
-                .map(Expr::List);
-
+                .map(Expr::List)
+                .labelled("list");
 
             let atom = val
+                .or(average)
+                .or(sum)
                 .or(ident.map(Expr::Local))
                 .or(list)
                 .map_with_span(|expr, span| (expr, span))
@@ -290,6 +335,7 @@ fn expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + C
         let ident = select! { Token::Ident(ident) => ident.clone() }.labelled("identifier");
         let operator = select! { Token::Op(op) => op.clone() }.labelled("operator");
 
+        // TODO: can do better then this
         let bool_expr = recursive(|raw_bool_expr| {
             raw_expr.clone()
                 .map_with_span(|expr, span: Span| (expr, span))
@@ -309,87 +355,90 @@ fn expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + C
 
         });
 
-        let ident_list =
-            ident
-            .clone()
-            .map_with_span(|ident, span| (ident, span))
-            .separated_by(just(Token::Ctrl(',')))
-            .allow_trailing()
-            .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')));
+        let transform_expr = recursive(|t_expr| {
+            let ident_list =
+                ident
+                .clone()
+                .map_with_span(|ident, span| (ident, span))
+                .separated_by(just(Token::Ctrl(',')))
+                .allow_trailing()
+                .delimited_by(just(Token::Ctrl('[')).or_not(), just(Token::Ctrl(']')).or_not());
 
-        let filter_expr =
-            just(Token::Filter)
-            .ignore_then(bool_expr)
-            .map(|expr| Expr::Filter(Box::new(expr)));
+            // TODO: make into Expr::Transform(Transform::Filter(Box::new(expr)))
+            let filter_expr =
+                just(Token::Filter)
+                .ignore_then(bool_expr)
+                .map(|expr| Expr::Filter(Box::new(expr)));
 
-        let pipeline = expr.clone()
-            .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')')));
+            let assignment =
+                ident
+                .then_ignore(just(Token::Op("=".to_string())))
+                .then(raw_expr.clone())
+                .map_with_span(|(ident, expr), span| (Expr::Assignment(ident, Box::new(expr)), span));
 
-        let group_expr =
-            just(Token::Group)
-            .ignore_then(ident_list)
-            .then(pipeline)
-            .map(|(idents, pipeline)| Expr::Group(idents, Box::new(pipeline)));
-
-
-        let calculation_expression = raw_expr.clone();
-
-        let assignment =
-            ident
-            .then_ignore(just(Token::Op("=".to_string())))
-            .then(calculation_expression.clone())
-            .map_with_span(|(ident, expr), span| (Expr::Assignment(ident, Box::new(expr)), span));
-
-        let derive_list =
-            assignment
-            .separated_by(just(Token::Ctrl(',')))
-            .allow_trailing()
-            .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')));
-            
-
-        let derive_expr =
-            just(Token::Derive)
-            .ignore_then(derive_list)
-            .map(|expr| Expr::Derive(expr));
-
-        let transform = filter_expr.clone()
-            .or(group_expr.clone())
-            .or(derive_expr.clone())
-            .then_ignore(just(Token::Ctrl('|')).or_not());
-
-        let from_expr =
-            just(Token::From)
-            .ignore_then(ident)
-            .then(transform.map_with_span(|expr, span: Span| (expr, span)).repeated())
-            .map(|(ident, transforms)| Expr::FromTable(ident, transforms))
-            .map_with_span(|expr, span: Span| (expr, span));
+            let aggregate_transform =
+                just(Token::Aggregate)
+                .ignore_then(
+                    assignment.clone().or(raw_expr.clone())
+                        .separated_by(just(Token::Ctrl(','))).allow_trailing()
+                        .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')))
+                )
+                .map(Expr::Aggregate);
 
 
-            /*
-        let block = expr
-            .clone()
-            .delimited_by(just(Token::Ctrl('{')), just(Token::Ctrl('}')))
-            .recover_with(nested_delimiters(
-                Token::Ctrl('{'),
-                Token::Ctrl('}'),
-                [
-                    (Token::Ctrl('('), Token::Ctrl(')')),
-                    (Token::Ctrl('['), Token::Ctrl(']')),
-                ],
-                |span| (Expr::Error, span),
-            ))
-            .labelled("block");
+            let group_transform =
+                just(Token::Group)
+                .ignore_then(ident_list)
+                .then(
+                    t_expr.clone()
+                    .separated_by(just(Token::Ctrl(','))).allow_trailing()
+                    .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')')))
+                )
+                .map(|(idents, pipeline)| Expr::Group(idents, pipeline));
 
-        let block_chain = block
-            .clone()
-            .then(block.clone().repeated())
-            .foldl(|a, b| {
-                let span = a.1.start..b.1.end;
-                (Expr::Then(Box::new(a), Box::new(b)), span)
-            });
-            */
 
-        from_expr.clone()
+            let derive_transform =
+                just(Token::Derive)
+                .ignore_then(
+                    assignment
+                    .separated_by(just(Token::Ctrl(',')))
+                    .allow_trailing()
+                    .delimited_by(just(Token::Ctrl('[')).or_not(), just(Token::Ctrl(']')).or_not())
+                )
+                .map(|expr| Expr::Derive(expr));
+
+
+            let sort_direction = just(Token::Op("-".to_string())).to(SortDirection::Desc).or(just(Token::Op("+".to_string())).to(SortDirection::Asc));
+            let sort_column = sort_direction.or_not().map(|dir| match dir { Some(d) => d, None => SortDirection::Asc }).then(ident.clone())
+                .map(|(direction, column)| SortColumn { direction, column });
+
+            let sort_columns =
+                sort_column
+                .map_with_span(|expr, span| (expr, span))
+                .separated_by(just(Token::Ctrl(',')))
+                .allow_trailing()
+                .delimited_by(just(Token::Ctrl('[')).or_not(), just(Token::Ctrl(']')).or_not())
+                .map(|sort_columns| Expr::Sort(sort_columns));
+
+            let sort_transform = just(Token::Sort).ignore_then(sort_columns);
+
+            let from_transform =
+                just(Token::From)
+                .ignore_then(ident)
+                .then(t_expr.repeated())
+                .map(|(ident, transforms)| Expr::FromTable(ident, transforms));
+
+            from_transform
+                .or(filter_expr.clone())
+                .or(group_transform.clone())
+                .or(derive_transform.clone())
+                .or(aggregate_transform.clone())
+                .or(sort_transform.clone())
+                .then_ignore(just(Token::Ctrl('|')).or_not())
+                .map_with_span(|expr, span: Span| (expr, span))
+        });
+
+        transform_expr.clone()
             .then(expr.repeated())
             .foldl(|a, b| {
                 let span = a.1.start..b.1.end;
