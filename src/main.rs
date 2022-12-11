@@ -1,12 +1,16 @@
 use ariadne::{Color, Fmt, Label, Report, ReportKind, Source};
 use chumsky::{prelude::*, stream::Stream};
 use std::{env, fmt, fs};
+use std::fs::soft_link;
+use chumsky::text::{Character, ident};
 
 //
 // LEXER
 //
 
 pub type Span = std::ops::Range<usize>;
+
+type Qualifier = (String, bool);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Token {
@@ -15,17 +19,13 @@ enum Token {
     Num(String),
     Str(String),
     FStr(String),
+    SStr(String),
     Date(String, String, String),
     Op(String),
-    Ident(String),
+    Ident(Vec<Qualifier>),
+    Type(String),
     Ctrl(char),
-    From,
-    Derive,
-    Filter,
-    Select,
-    Group,
-    Aggregate,
-    Sort,
+    Break,
 }
 
 impl fmt::Display for Token {
@@ -36,21 +36,34 @@ impl fmt::Display for Token {
             Token::Num(n) => write!(f, "{}", n),
             Token::Str(s) => write!(f, "\"{}\"", s),
             Token::FStr(s) => write!(f, "f\"{}\"", s),
+            Token::SStr(s) => write!(f, "s\"{}\"", s),
             Token::Date(y, m, d) => write!(f, "{}-{}-{}", y, m, d),
             Token::Op(s) => write!(f, "{}", s),
             Token::Ctrl(c) => write!(f, "{}", c),
-            Token::Ident(s) => write!(f, "{}", s),
-            Token::From => write!(f, "from"),
-            Token::Derive => write!(f, "derive"),
-            Token::Filter => write!(f, "filter"),
-            Token::Select => write!(f, "select"),
-            Token::Group => write!(f, "group"),
-            Token::Aggregate => write!(f, "aggregate"),
-            Token::Sort => write!(f, "sort"),
+            Token::Ident(qualifiers) => {
+                write!(f, "{}",
+                       qualifiers.iter().map(|(ident, quoted)| {
+                           if *quoted {
+                               format!("`{}`", ident)
+                           } else {
+                               ident.to_string()
+                           }
+                       }).collect::<Vec<_>>().join(".")
+                )
+            },
+            Token::Type(s) => write!(f, "<{}>", s),
+            Token::Break => write!(f, "[break]"),
         }
     }
 }
 
+fn namespaced_ident() -> impl Parser<char, Vec<Qualifier>, Error = Simple<char>> {
+    // TODO: use none_of for quoting
+    let quoting = just('`');
+    let qualifier = quoting.clone().or_not().then(ident()).then(quoting.clone().or_not()).map(|((qs,i),qe)| (i, qe == Some('`')));
+
+    qualifier.clone().chain::<Qualifier, _, _>(just('.').ignore_then(qualifier.clone()).repeated())
+}
 
 fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     let num = text::int(10)
@@ -69,16 +82,17 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         .map(Token::Str);
 
     let fstrings = just('f').ignore_then(string_expr.clone()).collect::<String>().map(Token::FStr);
+    let sstrings = just('s').ignore_then(string_expr.clone()).collect::<String>().map(Token::FStr);
 
     let date = just('@')
         .ignore_then(
-            filter(|c: &char| c.is_digit(10)).repeated().exactly(4).collect()
+            filter(|c: &char| c.is_digit(10)).repeated().exactly(4).collect::<String>()
             .then_ignore(just("-"))
-            .then(filter(|c: &char| c.is_digit(10)).repeated().exactly(2).collect())
+            .then(filter(|c: &char| c.is_digit(10)).repeated().exactly(2).collect::<String>())
             .then_ignore(just("-"))
-            .then(filter(|c: &char| c.is_digit(10)).repeated().exactly(2).collect())
+            .then(filter(|c: &char| c.is_digit(10)).repeated().exactly(2).collect::<String>())
         )
-        .map( |((year, month), day)| Token::Date(year, month, day));
+        .map( |((year, month), day)| Token::Date(year.to_string(), month.to_string(), day.to_string()));
 
     let op = one_of("+-*/!=><?.")
         .repeated()
@@ -88,37 +102,42 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
 
     let ctrl = one_of("()[]{}|,").map(Token::Ctrl);
 
-    // TODO: might have to support dots between idents
-    let ident = text::ident().map(|ident: String| match ident.as_str() {
+    /*
+    TODO:
+    let keywords = select! {
         "null" => Token::Null,
-        "from" => Token::From,
-        "derive" => Token::Derive,
-        "filter" => Token::Filter,
-        "select" => Token::Select,
-        "group" => Token::Group,
-        "aggregate" => Token::Aggregate,
-        "sort" => Token::Sort,
         "true" => Token::Bool(true),
         "false" => Token::Bool(false),
-        _ => Token::Ident(ident),
-    });
+    };
+     */
+
+    let ident = namespaced_ident().map(Token::Ident);
 
     let token = date
         .or(num)
         .or(fstrings)
+        .or(sstrings)
         .or(strings)
         .or(op)
         .or(ctrl)
+        //.or(keywords)
         .or(ident)
-        .recover_with(skip_then_retry_until([]));
+        .recover_with(skip_then_retry_until([])); // TODO: BETTER RECOVERY STRATEGY
 
-    let comment = just('#').then(take_until(just('\n'))).padded();
+    let inline_whitespace = filter(|c| *c == ' ' || *c == '\t').repeated();
+    let comment = just('#').then(take_until(just('\n'))).repeated();
+    let breaks = just('\n').to(Token::Break).map_with_span(|a,b| (a,b)).repeated();
 
+    breaks.clone().chain(token.map_with_span(|a,b| (a,b)).padded_by(comment).padded_by(inline_whitespace)).chain(breaks.clone()).repeated().flatten()
+        /*
     token
         .map_with_span(|tok, span| (tok, span))
         .padded_by(comment.repeated())
+        .padded_by(breaks)
         .padded()
         .repeated()
+
+         */
 }
 
 //
@@ -127,19 +146,22 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
 
 
 #[derive(Clone, Debug, PartialEq)]
-enum Value {
+enum ColumnExpression {
     Null,
     Bool(bool),
     Num(f64), // TODO: leave as string?
     Range(f64, f64), // TODO: leave as string?
     Str(String),
     FStr(String),
+    SStr(String),
     Date(String, String, String),
-    List(Vec<Value>),
+    List(Vec<ColumnExpression>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Operator {
+    Coalesce,
+    Equality,
     Unknown(String),
 }
 
@@ -148,7 +170,7 @@ struct Error {
     msg: String,
 }
 
-impl std::fmt::Display for Value {
+impl std::fmt::Display for ColumnExpression {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::Null => write!(f, "null"),
@@ -157,6 +179,7 @@ impl std::fmt::Display for Value {
             Self::Range(x, y) => write!(f, "{}..{}", x, y),
             Self::Str(x) => write!(f, "{}", x),
             Self::FStr(x) => write!(f, "{}", x),
+            Self::SStr(x) => write!(f, "{}", x),
             Self::Date(y, m, d) => write!(f, "{}-{}-{}", y, m, d),
             Self::List(xs) => write!(
                 f,
@@ -195,201 +218,52 @@ struct SortColumn {
     column: String,
 }
 
-
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Expr {
     Error,
-    Value(Value),
-    Local(String),
+    Value(ColumnExpression),
+    Local(Vec<Qualifier>),
     List(Vec<Spanned<Self>>),
     Bool(Box<Spanned<Self>>, Spanned<Operator>, Box<Spanned<Self>>),
     Assignment(String, Box<Spanned<Self>>),
     Binary(Box<Spanned<Self>>, BinaryOp, Box<Spanned<Self>>),
-    Average(Box<Spanned<Self>>),
-    Sum(Box<Spanned<Self>>),
+    Call(Vec<Spanned<Self>>),
+    FuncCall {
+        func: Box<Spanned<Self>>,
+        //arg: Box<Spanned<Self>>,
+        args: Vec<Spanned<Self>>,
+    },
+    Pipeline(Vec<Spanned<Self>>),
+    Break,
 }
 
-#[derive(Debug)]
-enum Transform {
-    Filter(Box<Spanned<Expr>>),
-    Group(Vec<Spanned<String>>, Vec<Spanned<Self>>),
-    Aggregate(Vec<Spanned<Expr>>),
-    Derive(Vec<Spanned<Expr>>), // TODO: these are all assignments
-    Sort(Vec<Spanned<SortColumn>>),
-    Take(Value),
+/*
+fn pipeline_expr_parser() -> impl Parser<Spanned<Expr>, Spanned<Expr>, Error = Simple<Expr>> + Clone {
+    value_expr_parser().chain(value_expr_parser())
 }
-
-#[derive(Debug)]
-struct Table {
-    name: String,
-    transforms: Vec<Spanned<Transform>>,
-}
-
-#[derive(Debug)]
-struct Query {
-    tables: Vec<Spanned<Table>>,
-}
-
-
-fn bool_expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + Clone {
-    let value_expr = value_expr_parser();
-    let operator = select! { Token::Op(op) => op.clone() }.labelled("operator");
-    recursive(|raw_bool_expr| {
-        value_expr.clone()
-            .map_with_span(|expr, span: Span| (expr, span))
-            .then(operator)
-            .then(value_expr.clone().map_with_span(|expr, span: Span| (expr, span)))
-            .map(|(((expr_a, span_a), op), (expr_b, span_b))| {
-                let span = span_a.start..span_b.end;
-                (
-                    Expr::Bool(
-                        Box::new(expr_a),
-                        (Operator::Unknown(op), 0..0), // TODO:
-                        Box::new(expr_b),
-                    ),
-                    span
-                )
-            })
-
-    })
-}
-
-fn table_parser() -> impl Parser<Token, Spanned<Table>, Error = Simple<Token>> + Clone {
-    let ident = select! { Token::Ident(ident) => ident.clone() }.labelled("identifier");
-    let ident_list =
-        ident
-        .clone()
-        .map_with_span(|ident, span| (ident, span))
-        .separated_by(just(Token::Ctrl(',')))
-        .allow_trailing()
-        .delimited_by(just(Token::Ctrl('[')).or_not(), just(Token::Ctrl(']')).or_not());
-
-    let value_expr = value_expr_parser();
-    let bool_expr = bool_expr_parser();
-
-    let pipeline = recursive(|pipeline_expr: Recursive<Token, Spanned<Transform>, _>| {
-        let filter_transform =
-            just(Token::Filter)
-            .ignore_then(bool_expr)
-            .map(|expr| Transform::Filter(Box::new(expr)));
-
-        let assignment =
-            ident
-            .then_ignore(just(Token::Op("=".to_string())))
-            .then(value_expr.clone())
-            .map_with_span(|(ident, expr), span| (Expr::Assignment(ident, Box::new(expr)), span));
-
-        let aggregate_transform =
-            just(Token::Aggregate)
-            .ignore_then(
-                assignment.clone().or(value_expr.clone())
-                    .separated_by(just(Token::Ctrl(','))).allow_trailing()
-                    .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')))
-            )
-            .map(Transform::Aggregate);
-
-
-        let group_transform =
-            just(Token::Group)
-            .ignore_then(ident_list)
-            .then(
-                pipeline_expr.clone()
-                .separated_by(just(Token::Ctrl(','))).allow_trailing()
-                .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')')))
-            )
-            .map(|(idents, pipeline)| Transform::Group(idents, pipeline));
-
-
-        let derive_transform =
-            just(Token::Derive)
-            .ignore_then(
-                assignment
-                .separated_by(just(Token::Ctrl(',')))
-                .allow_trailing()
-                .delimited_by(just(Token::Ctrl('[')).or_not(), just(Token::Ctrl(']')).or_not())
-            )
-            .map(|expr| Transform::Derive(expr));
-
-
-        let sort_direction = just(Token::Op("-".to_string())).to(SortDirection::Desc).or(just(Token::Op("+".to_string())).to(SortDirection::Asc));
-        let sort_column = sort_direction.or_not().map(|dir| match dir { Some(d) => d, None => SortDirection::Asc }).then(ident.clone())
-            .map(|(direction, column)| SortColumn { direction, column });
-
-        let sort_columns =
-            sort_column
-            .map_with_span(|expr, span| (expr, span))
-            .separated_by(just(Token::Ctrl(',')))
-            .allow_trailing()
-            .delimited_by(just(Token::Ctrl('[')).or_not(), just(Token::Ctrl(']')).or_not())
-            .map(|sort_columns| Transform::Sort(sort_columns));
-
-        let sort_transform = just(Token::Sort).ignore_then(sort_columns);
-
-        let number = select! { Token::Num(n) => n.parse().unwrap() }.labelled("number");
-        let number_expr = number.map(|n| Value::Num(n));
-
-        let number_range =
-            number
-            .then_ignore(just(Token::Op("..".to_string())))
-            .then(number)
-            .map(|(a, b)| Value::Range(a, b));
-
-        let take_transform =
-            just(Token::Ident("take".to_string()))
-            .ignore_then(number_range.or(number_expr))
-            .map(|num_or_range| Transform::Take(num_or_range));
-
-        filter_transform.clone()
-            .or(group_transform.clone())
-            .or(derive_transform.clone())
-            .or(aggregate_transform.clone())
-            .or(sort_transform.clone())
-            .or(take_transform.clone())
-            .map_with_span(|transform: Transform, span: Span| (transform, span))
-    });
-
-    just(Token::From)
-        .ignore_then(ident)
-        .then(
-            pipeline
-            .separated_by(just(Token::Ctrl('|')).or_not()).allow_trailing()
-        )
-        .map_with_span(|(name, transforms), span| {
-            (
-                Table { name, transforms },
-                span
-            )
-        })
-}
+ */
 
 fn value_expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token>> + Clone {
-    recursive(|value_expr| {
+    let val_expr = recursive(|value_expr| {
         let val = select! {
-            Token::Null => Expr::Value(Value::Null),
-            Token::Bool(x) => Expr::Value(Value::Bool(x)),
-            Token::Num(n) => Expr::Value(Value::Num(n.parse().unwrap())),
-            Token::Str(s) => Expr::Value(Value::Str(s)),
-            Token::FStr(s) => Expr::Value(Value::FStr(s)),
-            Token::Date(y, m, d) => Expr::Value(Value::Date(y, m, d)),
+            Token::Null => Expr::Value(ColumnExpression::Null),
+            Token::Bool(x) => Expr::Value(ColumnExpression::Bool(x)),
+            Token::Num(n) => Expr::Value(ColumnExpression::Num(n.parse().unwrap())),
+            Token::Str(s) => Expr::Value(ColumnExpression::Str(s)),
+            Token::FStr(s) => Expr::Value(ColumnExpression::FStr(s)),
+            Token::SStr(s) => Expr::Value(ColumnExpression::SStr(s)),
+            Token::Date(y, m, d) => Expr::Value(ColumnExpression::Date(y, m, d)),
+            // TODO: RANGE
         }
-        .labelled("value");
+        .labelled("column");
 
-        let ident = select! { Token::Ident(ident) => ident.clone() }.labelled("identifier");
+
+        let ident = select! { Token::Ident(idents) => Expr::Local(idents) }.labelled("identifier");
 
         let items = value_expr
             .clone()
             .separated_by(just(Token::Ctrl(',')))
             .allow_trailing();
-
-        let average =
-            just(Token::Ident("average".to_string()))
-            .ignore_then(value_expr.clone())
-            .map(|expr| Expr::Average(Box::new(expr)));
-
-        let sum =
-            just(Token::Ident("sum".to_string()))
-            .ignore_then(value_expr.clone())
-            .map(|expr| Expr::Sum(Box::new(expr)));
 
         let list = items
             .clone()
@@ -397,10 +271,10 @@ fn value_expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token
             .map(Expr::List)
             .labelled("list");
 
-        let atom = val
-            .or(average)
-            .or(sum)
-            .or(ident.map(Expr::Local))
+        let atom = //filter(|t| *t == Token::Break).ignored().then(
+        just(Token::Break).or_not().ignore_then(
+            val
+            .or(ident)
             .or(list)
             .map_with_span(|expr, span| (expr, span))
             .or(value_expr.clone().delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')'))))
@@ -421,11 +295,14 @@ fn value_expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token
                     (Token::Ctrl('{'), Token::Ctrl('}')),
                 ],
                 |span| (Expr::Error, span),
-            ));
+            ))
+        );
+
+        // TODO: this operator stuff is messy
 
         let op = just(Token::Op("??".to_string())).to(BinaryOp::Nullify);
         let coalesce = atom.clone()
-            .then(op.then(atom).repeated())
+            .then(op.then(atom.clone()).repeated())
             .foldl(|a, (op, b)| {
                 let span = a.1.start..b.1.end;
                 (Expr::Binary(Box::new(a), op, Box::new(b)), span)
@@ -465,29 +342,33 @@ fn value_expr_parser() -> impl Parser<Token, Spanned<Expr>, Error = Simple<Token
             });
 
         compare
+    });
 
+    choice((just(Token::Break).map_with_span(|a,b|(Expr::Break,b)), val_expr)).repeated().map_with_span(|expr, span| {
+        (Expr::Call(expr), span)
     })
 }
 
-fn query_parser() -> impl Parser<Token, Query, Error = Simple<Token>> + Clone {
-    table_parser().repeated().map(|tables| Query { tables }).then_ignore(end())
-}
 
 //
 // MAIN
 //
 
 fn main() {
-    let src = fs::read_to_string(env::args().nth(1).expect("Expected file argument"))
-        .expect("Failed to read file");
+    //let src = fs::read_to_string(env::args().nth(1).expect("Expected file argument"))
+    //    .expect("Failed to read file");
+    let src = "from employees
+    derive a #= 2
+    derive b #= 6
+    ";
 
-    let (tokens, mut errs) = lexer().parse_recovery(src.as_str());
+    let (tokens, mut errs) = lexer().parse_recovery(src);
 
     let parse_errs = if let Some(tokens) = tokens {
         dbg!(tokens.clone());
         let len = src.chars().count();
         let (ast, parse_errs) =
-            query_parser().parse_recovery(Stream::from_iter(len..len + 1, tokens.into_iter()));
+            value_expr_parser().parse_recovery(Stream::from_iter(len..len + 1, tokens.into_iter()));
 
         dbg!(ast);
         parse_errs
@@ -564,4 +445,115 @@ fn main() {
 
             report.finish().print(Source::from(&src)).unwrap();
         });
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_bool_expr() -> Result<(), ()> {
+        //let src = "1 + 2 == 3";
+        //let src = "take 1";
+        //let src = "(take 1)";
+        //let src = "(take 1) (from employees)";
+        //let src = "(take 1) (from employees)";
+        //let src = "from employees (top_one)";
+        //let src = "take (a - 2) (from employees)";
+        //let src = "testing.`uniq` [a,b,c] (from employees)";
+        let src = "
+from employees
+derive
+[
+    gross_salary ## = salary + tax
+    gross_cost ## = salary + benefits
+]
+        ";
+        let (tokens, mut errs) = lexer().parse_recovery(src);
+
+        let parse_errs =
+            if let Some(tokens) = tokens {
+                dbg!(tokens.clone());
+                let len = src.chars().count();
+                let (ast, parse_errs) =
+                    value_expr_parser().parse_recovery(Stream::from_iter(len..len + 1, tokens.into_iter()));
+
+                dbg!(ast);
+                parse_errs
+            } else {
+                Vec::new()
+            };
+
+        errs.into_iter()
+            .map(|e| e.map(|c| c.to_string()))
+            .chain(parse_errs.into_iter().map(|e| e.map(|tok| tok.to_string())))
+            .for_each(|e| {
+                let report = Report::build(ReportKind::Error, (), e.span().start);
+
+                let report = match e.reason() {
+                    chumsky::error::SimpleReason::Unclosed { span, delimiter } => report
+                        .with_message(format!(
+                            "Unclosed delimiter {}",
+                            delimiter.fg(Color::Yellow)
+                        ))
+                        .with_label(
+                            Label::new(span.clone())
+                                .with_message(format!(
+                                    "Unclosed delimiter {}",
+                                    delimiter.fg(Color::Yellow)
+                                ))
+                                .with_color(Color::Yellow),
+                        )
+                        .with_label(
+                            Label::new(e.span())
+                                .with_message(format!(
+                                    "Must be closed before this {}",
+                                    e.found()
+                                        .unwrap_or(&"end of file".to_string())
+                                        .fg(Color::Red)
+                                ))
+                                .with_color(Color::Red),
+                        ),
+                    chumsky::error::SimpleReason::Unexpected => report
+                        .with_message(format!(
+                            "{}, expected {}",
+                            if e.found().is_some() {
+                                "Unexpected token in input"
+                            } else {
+                                "Unexpected end of input"
+                            },
+                            if e.expected().len() == 0 {
+                                "something else".to_string()
+                            } else {
+                                e.expected()
+                                    .map(|expected| match expected {
+                                        Some(expected) => expected.to_string(),
+                                        None => "end of input".to_string(),
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            }
+                        ))
+                        .with_label(
+                            Label::new(e.span())
+                                .with_message(format!(
+                                    "Unexpected token {}",
+                                    e.found()
+                                        .unwrap_or(&"end of file".to_string())
+                                        .fg(Color::Red)
+                                ))
+                                .with_color(Color::Red),
+                        ),
+                    chumsky::error::SimpleReason::Custom(msg) => report.with_message(msg).with_label(
+                        Label::new(e.span())
+                            .with_message(format!("{}", msg.fg(Color::Red)))
+                            .with_color(Color::Red),
+                    ),
+                };
+
+                report.finish().print(Source::from(&src)).unwrap();
+            });
+
+        Ok(())
+    }
 }
